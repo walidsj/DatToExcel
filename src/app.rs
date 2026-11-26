@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Instant;
@@ -125,12 +126,70 @@ fn badge(ui: &mut Ui, text: impl Into<String>, fg: Color32, bg: Color32) {
         });
 }
 
-fn primary_button(text: &str, width: f32) -> egui::Button<'static> {
-    egui::Button::new(RichText::new(text.to_string()).color(Color32::WHITE).strong())
-        .fill(palette::ACCENT)
-        .stroke(Stroke::NONE)
-        .corner_radius(CornerRadius::same(8))
-        .min_size(vec2(width, 40.0))
+/// Tombol utama konversi: ikon + label di tengah, warna aksen.
+fn convert_button(ui: &mut Ui, enabled: bool, working: bool, label: &str) -> egui::Response {
+    let size = vec2(ui.available_width(), 46.0);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let (rect, response) = ui.allocate_exact_size(size, sense);
+
+    let fill = if !enabled && !working {
+        Color32::from_rgb(0xC7, 0xC4, 0xF5)
+    } else if response.is_pointer_button_down_on() {
+        Color32::from_rgb(0x37, 0x30, 0xA3)
+    } else if response.hovered() {
+        Color32::from_rgb(0x43, 0x38, 0xCA)
+    } else {
+        palette::ACCENT
+    };
+
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(10), fill);
+
+    let font = FontId::proportional(15.0);
+    let galley = painter.layout_no_wrap(label.to_string(), font, Color32::WHITE);
+    let icon = 20.0;
+    let gap = 10.0;
+    let content = icon + gap + galley.size().x;
+    let left = rect.center().x - content / 2.0;
+    let icon_rect = egui::Rect::from_center_size(pos2(left + icon / 2.0, rect.center().y), vec2(icon, icon));
+
+    if working {
+        // Indikator berputar selama konversi.
+        let t = ui.input(|i| i.time) as f32;
+        let center = icon_rect.center();
+        let radius = icon / 2.0 - 2.0;
+        let points: Vec<egui::Pos2> = (0..=24)
+            .map(|i| {
+                let a = t * 5.0 + i as f32 / 24.0 * std::f32::consts::PI * 1.4;
+                center + vec2(a.cos(), a.sin()) * radius
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, Stroke::new(2.5_f32, Color32::WHITE)));
+        ui.ctx().request_repaint();
+    } else {
+        // Ikon lembar kerja: kotak dengan baris judul dan garis kisi.
+        let stroke = Stroke::new(1.6_f32, Color32::WHITE);
+        let sheet = icon_rect.shrink(1.0);
+        painter.rect_stroke(sheet, CornerRadius::same(3), stroke, egui::StrokeKind::Inside);
+        let header = egui::Rect::from_min_max(sheet.min, pos2(sheet.max.x, sheet.min.y + sheet.height() * 0.3));
+        painter.rect_filled(header, CornerRadius { nw: 3, ne: 3, sw: 0, se: 0 }, Color32::WHITE);
+        let mid_y = sheet.min.y + sheet.height() * 0.65;
+        painter.line_segment([pos2(sheet.min.x, mid_y), pos2(sheet.max.x, mid_y)], stroke);
+        let mid_x = sheet.center().x;
+        painter.line_segment([pos2(mid_x, header.max.y), pos2(mid_x, sheet.max.y)], stroke);
+    }
+
+    painter.galley(
+        pos2(left + icon + gap, rect.center().y - galley.size().y / 2.0),
+        galley,
+        Color32::WHITE,
+    );
+
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
 }
 
 fn format_count(n: usize) -> String {
@@ -218,7 +277,7 @@ enum Message {
     Loaded(Arc<DatFile>),
     LoadFailed { path: PathBuf, error: String },
     Log(Level, String),
-    Progress(f32),
+    Progress { value: f32, status: String },
     Finished { ok: usize, failed: usize, seconds: f32 },
 }
 
@@ -234,6 +293,7 @@ pub struct App {
     output_dir: Option<PathBuf>,
     logs: Vec<LogEntry>,
     progress: f32,
+    progress_status: String,
     converting: bool,
     tx: Sender<Message>,
     rx: Receiver<Message>,
@@ -250,6 +310,7 @@ impl Default for App {
             output_dir: None,
             logs: Vec::new(),
             progress: 0.0,
+            progress_status: String::new(),
             converting: false,
             tx,
             rx,
@@ -363,12 +424,16 @@ impl App {
 
         self.converting = true;
         self.progress = 0.0;
+        self.progress_status = "Menyiapkan…".to_string();
         self.log(Level::Info, format!("Memulai konversi {} file…", files.len()));
 
         thread::spawn(move || {
             let started = Instant::now();
             let total_rows: usize = files.iter().map(|f| f.table.rows()).sum::<usize>().max(1);
             let mut done_rows = 0usize;
+            // Perkiraan lama simpan relatif terhadap lama menulis baris;
+            // diperbarui dari hasil nyata tiap file.
+            let mut save_ratio = 0.85_f32;
             let (mut ok, mut failed) = (0, 0);
 
             for file in &files {
@@ -387,12 +452,68 @@ impl App {
                 let output_path = unique_output_path(&dir, &file.path);
                 let _ = tx.send(Message::Log(Level::Info, format!("Memproses {}…", file.name)));
 
-                let base = done_rows;
-                let mut on_progress = |rows: usize| {
-                    let _ = tx.send(Message::Progress((base + rows) as f32 / total_rows as f32));
+                // Bobot file sebanding jumlah barisnya; di dalam file, porsi
+                // menulis dan menyimpan dibagi sesuai perkiraan durasinya.
+                let base = done_rows as f32 / total_rows as f32;
+                let weight = file.table.rows() as f32 / total_rows as f32;
+                let write_share = 1.0 / (1.0 + save_ratio);
+                let output_name = output_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+
+                let write_started = Instant::now();
+                let mut write_elapsed = 0.0_f32;
+                let mut saver: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)> = None;
+
+                let mut on_progress = |stage: excel::Stage| match stage {
+                    excel::Stage::Writing { rows, total } => {
+                        let fraction = rows as f32 / total.max(1) as f32;
+                        let _ = tx.send(Message::Progress {
+                            value: base + weight * write_share * fraction,
+                            status: format!("Menulis data {}…", file.name),
+                        });
+                    }
+                    excel::Stage::Saving => {
+                        write_elapsed = write_started.elapsed().as_secs_f32();
+                        let expected = (write_elapsed * save_ratio).max(0.05);
+                        let stop = Arc::new(AtomicBool::new(false));
+                        let flag = Arc::clone(&stop);
+                        let tx = tx.clone();
+                        let status = format!("Menyimpan {output_name}…");
+
+                        // Penyimpanan tidak melaporkan kemajuan; perkirakan dari waktu.
+                        let handle = thread::spawn(move || {
+                            let started = Instant::now();
+                            while !flag.load(Ordering::Relaxed) {
+                                let fraction = saving_fraction(started.elapsed().as_secs_f32() / expected);
+                                let _ = tx.send(Message::Progress {
+                                    value: base + weight * (write_share + (1.0 - write_share) * fraction),
+                                    status: status.clone(),
+                                });
+                                thread::sleep(std::time::Duration::from_millis(60));
+                            }
+                        });
+                        saver = Some((stop, handle));
+                    }
                 };
 
-                match excel::convert(&file.table, &file.profiles, &column_types, &output_path, &mut on_progress) {
+                let result = excel::convert(&file.table, &file.profiles, &column_types, &output_path, &mut on_progress);
+
+                if let Some((stop, handle)) = saver.take() {
+                    stop.store(true, Ordering::Relaxed);
+                    let _ = handle.join();
+                    let total = write_started.elapsed().as_secs_f32();
+                    if write_elapsed > 0.05 {
+                        save_ratio = ((total - write_elapsed) / write_elapsed).clamp(0.2, 3.0);
+                    }
+                }
+                let _ = tx.send(Message::Progress {
+                    value: base + weight,
+                    status: format!("Selesai {}", file.name),
+                });
+
+                match result {
                     Ok(stats) => {
                         ok += 1;
                         let sheets = if stats.sheets > 1 {
@@ -485,10 +606,16 @@ impl App {
                     self.log(Level::Error, format!("Gagal membaca {}: {error}", path.display()));
                 }
                 Message::Log(level, text) => self.log(level, text),
-                Message::Progress(progress) => self.progress = progress,
+                Message::Progress { value, status } => {
+                    if self.converting {
+                        self.progress = self.progress.max(value.min(1.0));
+                        self.progress_status = status;
+                    }
+                }
                 Message::Finished { ok, failed, seconds } => {
                     self.converting = false;
                     self.progress = 1.0;
+                    self.progress_status = "Selesai".to_string();
                     let level = if failed == 0 { Level::Success } else { Level::Warn };
                     self.log(
                         level,
@@ -501,6 +628,16 @@ impl App {
         if self.busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(80));
         }
+    }
+}
+
+/// Perkiraan kemajuan simpan dari rasio waktu berjalan/perkiraan: linear
+/// sampai 90%, lalu melambat mendekati 99% agar tidak pernah "selesai" duluan.
+fn saving_fraction(ratio: f32) -> f32 {
+    if ratio < 0.9 {
+        ratio.max(0.0)
+    } else {
+        0.9 + 0.09 * (1.0 - (-(ratio - 0.9) * 4.0).exp())
     }
 }
 
@@ -815,11 +952,8 @@ impl App {
             ui.add_space(8.0);
 
             let label = if self.converting { "Mengonversi…" } else { "Konversi ke Excel" };
-            let width = ui.available_width();
-            if ui
-                .add_enabled(!self.busy() && !self.files.is_empty(), primary_button(label, width))
-                .clicked()
-            {
+            let enabled = !self.busy() && !self.files.is_empty();
+            if convert_button(ui, enabled, self.converting, label).clicked() {
                 self.start_conversion();
             }
 
@@ -832,12 +966,18 @@ impl App {
                         .fill(if self.converting { palette::ACCENT } else { palette::SUCCESS })
                         .animate(self.converting),
                 );
-                let status = if self.converting {
-                    format!("{:.0}%", self.progress * 100.0)
-                } else {
-                    "Selesai".to_string()
-                };
-                ui.label(RichText::new(status).small().color(palette::MUTED));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!("{:.0}%", self.progress * 100.0))
+                            .small()
+                            .strong()
+                            .color(palette::TEXT),
+                    );
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        let status = if self.converting { self.progress_status.as_str() } else { "Selesai" };
+                        ui.add(egui::Label::new(RichText::new(status).small().color(palette::MUTED)).truncate());
+                    });
+                });
             }
         });
     }

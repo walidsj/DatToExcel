@@ -290,6 +290,15 @@ pub struct ConvertStats {
     pub fallback_examples: Vec<String>,
 }
 
+/// Tahap konversi yang dilaporkan ke pemanggil.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stage {
+    /// Menulis baris ke worksheet: `rows` dari `total` selesai.
+    Writing { rows: usize, total: usize },
+    /// Membangun dan mengompresi file xlsx lalu menyimpannya ke disk.
+    Saving,
+}
+
 pub fn has_header(profiles: &[ColumnProfile]) -> bool {
     profiles.iter().any(|p| p.header_mismatch)
 }
@@ -299,7 +308,7 @@ pub fn convert(
     profiles: &[ColumnProfile],
     column_types: &[ColumnType],
     output_path: &Path,
-    progress: &mut dyn FnMut(usize),
+    progress: &mut dyn FnMut(Stage),
 ) -> Result<ConvertStats, String> {
     let columns = table.columns();
     if columns > 16_384 {
@@ -386,7 +395,10 @@ pub fn convert(
             excel_row += 1;
 
             if (row + 1) % 2_000 == 0 {
-                progress(row + 1);
+                progress(Stage::Writing {
+                    rows: row + 1,
+                    total: table.rows(),
+                });
             }
         }
 
@@ -397,7 +409,11 @@ pub fn convert(
         }
     }
 
-    progress(table.rows());
+    progress(Stage::Writing {
+        rows: table.rows(),
+        total: table.rows(),
+    });
+    progress(Stage::Saving);
 
     workbook.save(output_path).map_err(xl)?;
     Ok(stats)

@@ -1,15 +1,16 @@
 //! Pembacaan file DAT/TXT/CSV menjadi tabel sel teks.
 //!
-//! Seluruh isi sel disimpan dalam satu buffer `String` dengan offset per sel,
-//! sehingga file ratusan ribu baris tetap hemat memori.
+//! Isi file disimpan sekali dalam satu `String`; setiap sel hanya berupa
+//! rentang (awal, akhir) di dalamnya, sehingga file besar dibaca cepat
+//! tanpa alokasi per sel.
 
 use std::fs;
 use std::path::Path;
 
 pub struct Table {
     text: String,
-    /// Offset akhir setiap sel di `text` (awal sel = akhir sel sebelumnya).
-    cell_ends: Vec<u32>,
+    /// Rentang byte setiap sel di `text`.
+    spans: Vec<[u32; 2]>,
     /// Indeks sel pertama untuk setiap baris; panjang = jumlah baris + 1.
     row_starts: Vec<u32>,
     columns: usize,
@@ -21,7 +22,7 @@ impl Table {
     fn new(delimiter: char, encoding: &'static str) -> Self {
         Self {
             text: String::new(),
-            cell_ends: Vec::new(),
+            spans: Vec::new(),
             row_starts: vec![0],
             columns: 0,
             delimiter,
@@ -45,25 +46,27 @@ impl Table {
             return "";
         }
 
-        let index = first + col;
-        let start = if index == 0 {
-            0
-        } else {
-            self.cell_ends[index - 1] as usize
-        };
-
-        &self.text[start..self.cell_ends[index] as usize]
+        let [start, end] = self.spans[first + col];
+        &self.text[start as usize..end as usize]
     }
 
+    /// Salin nilai ke buffer (dipakai parser ber-kutip yang perlu unescape).
     fn push_cell(&mut self, value: &str) -> Result<(), String> {
+        let start = self.text.len();
         self.text.push_str(value);
-        let end = u32::try_from(self.text.len()).map_err(|_| "File terlalu besar (> 4 GB).")?;
-        self.cell_ends.push(end);
+        self.push_span(start, self.text.len())
+    }
+
+    fn push_span(&mut self, start: usize, end: usize) -> Result<(), String> {
+        let too_big = || "File terlalu besar (> 4 GB).".to_string();
+        let start = u32::try_from(start).map_err(|_| too_big())?;
+        let end = u32::try_from(end).map_err(|_| too_big())?;
+        self.spans.push([start, end]);
         Ok(())
     }
 
     fn end_row(&mut self) -> Result<(), String> {
-        let count = u32::try_from(self.cell_ends.len()).map_err(|_| "Jumlah sel terlalu banyak.")?;
+        let count = u32::try_from(self.spans.len()).map_err(|_| "Jumlah sel terlalu banyak.")?;
         let len = (count - self.row_starts.last().copied().unwrap_or(0)) as usize;
 
         self.columns = self.columns.max(len);
@@ -78,23 +81,75 @@ impl Table {
 
 pub fn read_table(path: &Path) -> Result<Table, String> {
     let bytes = fs::read(path).map_err(|error| format!("Tidak dapat membaca file: {error}"))?;
-    parse_bytes(&bytes)
+    parse_owned(bytes)
 }
 
+#[cfg(test)]
 pub fn parse_bytes(bytes: &[u8]) -> Result<Table, String> {
+    parse_owned(bytes.to_vec())
+}
+
+pub fn parse_owned(bytes: Vec<u8>) -> Result<Table, String> {
     let (content, encoding) = decode_text(bytes)?;
     let (delimiter, has_terminator) = sniff_delimiter(&content);
 
     let mut table = Table::new(delimiter, encoding);
-    // File berpemisah pipa (DAT) tidak memakai kutip; tanda " diperlakukan biasa.
-    let quotes = delimiter != '|';
-    parse_content(&content, delimiter, has_terminator, quotes, &mut table)?;
+
+    if delimiter == '|' {
+        // File berpemisah pipa (DAT) tidak memakai kutip: jalur cepat tanpa
+        // alokasi per sel, rentang langsung menunjuk ke isi file.
+        parse_plain(&content, delimiter, has_terminator, &mut table)?;
+        table.text = content;
+    } else {
+        table.text.reserve(content.len());
+        parse_content(&content, delimiter, has_terminator, true, &mut table)?;
+        table.text.shrink_to_fit();
+    }
+
+    table.spans.shrink_to_fit();
+    table.row_starts.shrink_to_fit();
 
     if table.rows() == 0 {
         return Err("File tidak memiliki data.".to_string());
     }
 
     Ok(table)
+}
+
+/// Parser cepat untuk file tanpa kutip: memecah per baris lalu per delimiter.
+fn parse_plain(content: &str, delimiter: char, has_terminator: bool, table: &mut Table) -> Result<(), String> {
+    let base = content.as_ptr() as usize;
+    let offset = |s: &str| s.as_ptr() as usize - base;
+
+    // File dengan akhir baris CR saja (format Mac lama).
+    let newline = if !content.contains('\n') && content.contains('\r') { '\r' } else { '\n' };
+
+    let estimated_rows = content.len() / 48 + 1;
+    table.row_starts.reserve(estimated_rows);
+
+    for line in content.split(newline) {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let row_start = table.spans.len();
+        for field in line.split(delimiter) {
+            let field = field.trim();
+            let start = offset(field);
+            table.push_span(start, start + field.len())?;
+        }
+
+        // Buang satu field kosong terakhir bila file memakai delimiter penutup.
+        let fields = table.spans.len() - row_start;
+        if has_terminator && fields > 1 && table.spans.last().is_some_and(|[a, b]| a == b) {
+            table.spans.pop();
+        }
+
+        table.end_row()?;
+    }
+
+    Ok(())
 }
 
 /// Parser berbasis aliran karakter: mendukung field ber-kutip ("a|b", "a""b")
@@ -279,9 +334,10 @@ fn count_outside_quotes(line: &str, delimiter: char, quotes: bool) -> usize {
 // ENCODING
 // ============================================================
 
-fn decode_text(bytes: &[u8]) -> Result<(String, &'static str), String> {
-    if let Some(content) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8(content.to_vec())
+fn decode_text(mut bytes: Vec<u8>) -> Result<(String, &'static str), String> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        bytes.drain(..3);
+        return String::from_utf8(bytes)
             .map(|text| (text, "UTF-8"))
             .map_err(|error| format!("Encoding UTF-8 tidak valid: {error}"));
     }
@@ -302,16 +358,17 @@ fn decode_text(bytes: &[u8]) -> Result<(String, &'static str), String> {
         let half = sample.len() / 2;
 
         if zeros_odd * 10 >= half * 9 {
-            return decode_utf16(bytes, u16::from_le_bytes).map(|text| (text, "UTF-16 LE"));
+            return decode_utf16(&bytes, u16::from_le_bytes).map(|text| (text, "UTF-16 LE"));
         }
         if zeros_even * 10 >= half * 9 {
-            return decode_utf16(bytes, u16::from_be_bytes).map(|text| (text, "UTF-16 BE"));
+            return decode_utf16(&bytes, u16::from_be_bytes).map(|text| (text, "UTF-16 BE"));
         }
     }
 
-    match String::from_utf8(bytes.to_vec()) {
+    // UTF-8 divalidasi tanpa menyalin buffer.
+    match String::from_utf8(bytes) {
         Ok(text) => Ok((text, "UTF-8")),
-        Err(_) => Ok((bytes.iter().map(|&b| cp1252(b)).collect(), "Windows-1252")),
+        Err(error) => Ok((error.into_bytes().iter().map(|&b| cp1252(b)).collect(), "Windows-1252")),
     }
 }
 

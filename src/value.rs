@@ -589,8 +589,40 @@ impl Counts {
     }
 }
 
+/// Profil semua kolom; kolom dianalisis paralel di beberapa thread.
 pub fn profile_table(table: &Table) -> Vec<ColumnProfile> {
-    (0..table.columns()).map(|col| profile_column(table, col)).collect()
+    let columns = table.columns();
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(columns.max(1));
+
+    if threads <= 1 || table.rows() < 2_000 {
+        return (0..columns).map(|col| profile_column(table, col)).collect();
+    }
+
+    let mut profiles: Vec<Option<ColumnProfile>> = vec![None; columns];
+    std::thread::scope(|scope| {
+        let chunk = columns.div_ceil(threads);
+        for (index, slots) in profiles.chunks_mut(chunk).enumerate() {
+            scope.spawn(move || {
+                for (offset, slot) in slots.iter_mut().enumerate() {
+                    *slot = Some(profile_column(table, index * chunk + offset));
+                }
+            });
+        }
+    });
+
+    profiles.into_iter().map(|p| p.expect("profil kolom")).collect()
+}
+
+/// Pemeriksaan murah sebelum parsing tanggal: diawali digit dan memuat
+/// pemisah tanggal di 5 karakter pertama (format ringkas tidak dideteksi otomatis).
+fn may_be_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 6
+        && bytes[0].is_ascii_digit()
+        && bytes[..bytes.len().min(5)].iter().any(|b| matches!(b, b'-' | b'/' | b'.'))
 }
 
 fn profile_column(table: &Table, col: usize) -> ColumnProfile {
@@ -608,6 +640,9 @@ fn profile_column(table: &Table, col: usize) -> ColumnProfile {
             Some(DecimalSep::Dot) => dot += 1,
             Some(DecimalSep::Comma) => comma += 1,
             _ => {}
+        }
+        if !may_be_date(value) {
+            continue;
         }
         match date_order_evidence(value) {
             Some(DateOrder::Dmy) => dmy += 1,
@@ -649,7 +684,10 @@ fn profile_column(table: &Table, col: usize) -> ColumnProfile {
 
         if is_code_like(value) {
             counts.code += 1;
-        } else if let Some(date) = parse_date(value, date_order, false) {
+        } else if let Some(date) = may_be_date(value)
+            .then(|| parse_date(value, date_order, false))
+            .flatten()
+        {
             match date.time {
                 Some(time) => {
                     counts.datetime += 1;
@@ -658,7 +696,11 @@ fn profile_column(table: &Table, col: usize) -> ColumnProfile {
                 }
                 None => counts.date += 1,
             }
-        } else if let Some(pct) = parse_percentage(value, decimal_sep, true) {
+        } else if let Some(pct) = value
+            .ends_with('%')
+            .then(|| parse_percentage(value, decimal_sep, true))
+            .flatten()
+        {
             counts.percentage += 1;
             pct_decimals = pct_decimals.max(pct.decimals);
         } else if let Some(number) = number {
